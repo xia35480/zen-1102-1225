@@ -1,8 +1,9 @@
-name: zen-gateway
+name: zen-gateway-warp
 
-# 一台 runner = 一个出口 IP。额度按 IP 算，所以「换 IP」= 换一台 runner。
-# 4 小时软交班 + 硬超时兜底 + 每 20 分钟 cron 补位，保证链路不断。
-# 网关用仓库里的预编译二进制（bin/zen-direct），不在 runner 上编译。
+# Cloudflare WARP 节点模板：
+#   利用 Cloudflare WARP 双栈 TUN 虚拟网卡为网关提供 Anycast 出口，彻底规避机房 IP 拒连。
+#   4 小时软交班 + 硬超时兜底 + 429 秒级换 IP 自愈。
+#   网关直接复用预编译二进制（bin/zen-direct）。
 
 on:
   workflow_dispatch:
@@ -63,7 +64,6 @@ jobs:
           chmod +x bin/zen-direct
           ls -l bin/zen-direct
           sha256sum bin/zen-direct
-          # ZEN_PROBE_BODY 指向不存在的文件时二进制读完就退 2，用它确认产物能跑
           rc=0
           ZEN_PROBE_BODY=/nonexistent/zen-probe bin/zen-direct >/dev/null 2>&1 || rc=$?
           if [ "$rc" != "2" ]; then
@@ -71,7 +71,50 @@ jobs:
             exit 1
           fi
 
+      - name: Cache cloudflare-warp package
+        id: cache-warp-deb
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cloudflare-warp.deb
+          key: cloudflare-warp-deb-v2026.8
+
+      - name: Setup WARP (极速独立包安装 + 官方双栈)
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cache-warp-deb.outputs.cache-hit }}" != 'true' ] || [ ! -s /tmp/cloudflare-warp.deb ]; then
+            echo "下载 cloudflare-warp 极速独立包 (跳过耗时 apt-get update)..."
+            curl -fsSL --retry 3 --retry-delay 1 \
+              -o /tmp/cloudflare-warp.deb \
+              https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
+          fi
+          sudo dpkg -i /tmp/cloudflare-warp.deb || sudo apt-get install -f -y
+          sudo warp-cli --accept-tos registration new
+          sudo warp-cli --accept-tos mode warp+doh
+          sudo warp-cli --accept-tos connect
+          echo "WARP 官方客户端极速启动完毕"
+
+      - name: Fix DNS & Network Tuning (BBR + 双栈 DNS)
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+          sudo sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
+          echo "Public IPv4: $(curl -s4 --max-time 6 https://api.ipify.org || echo '?')"
+          echo "Public IPv6: $(curl -s6 --max-time 6 https://api6.ipify.org 2>/dev/null || echo 'none')"
+          curl -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=|colo=' || true
+
+      - name: Cache cloudflared binary
+        id: cache-cloudflared
+        uses: actions/cache@v4
+        with:
+          path: bin/cloudflared
+          key: cloudflared-linux-amd64-v1
+
       - name: Install cloudflared
+        if: steps.cache-cloudflared.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           curl -fsSL --retry 3 --retry-delay 2 \
@@ -85,8 +128,6 @@ jobs:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
           MAX_RUN_SEC: ${{ inputs.max_run_sec || '13800' }}
-          # 可选：上游出口代理（GitHub runner 的 Azure IP 常被免费层限掉）。
-          # 在仓库 Variables 里配 PROXY_URL=http://user:pass@host:port 即可。
           PROXY_URL: ${{ vars.PROXY_URL }}
         run: bash scripts/run-gateway.sh
 
@@ -97,11 +138,12 @@ jobs:
         run: |
           reason="$(cat run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
           {
-            echo "### zen-gateway"
+            echo "### zen-gateway-warp"
             echo ""
+            echo "- 模板类型：\`Cloudflare WARP (Dual-Stack TUN)\`"
             echo "- 交班原因：\`$reason\`"
             echo "- 本次时长：$(cat run/uptime.txt 2>/dev/null || echo '?')"
-            echo "- 出口 IP：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
+            echo "- 出口 IPv4：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
             echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
             echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
           } >> "$GITHUB_STEP_SUMMARY"
